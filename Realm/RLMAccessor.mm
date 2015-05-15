@@ -64,6 +64,44 @@ static inline void RLMVerifyInWriteTransaction(__unsafe_unretained RLMObjectBase
     }
 }
 
+template<typename FunctionType>
+static FunctionType RLMGetImpForSelector(Class cls, SEL selector) {
+    return reinterpret_cast<FunctionType>(method_getImplementation(class_getInstanceMethod(cls, selector)));
+}
+
+namespace {
+// Helper for calling superclass methods outside the context of a method
+class RLMSuperImpl {
+public:
+    RLMSuperImpl() { }
+
+    RLMSuperImpl(__unsafe_unretained RLMProperty *const prop, Class superClass)
+    : getterSel(prop.getterSel)
+    , getter(RLMGetImpForSelector<id (*)(id, SEL)>(superClass, getterSel))
+    , setterSel(prop.setterSel)
+    , setter(RLMGetImpForSelector<void (*)(id, SEL, id)>(superClass, setterSel))
+    {
+    }
+
+
+    id get(__unsafe_unretained id const obj) const {
+        return getter ? getter(obj, getterSel) : nil;
+    }
+
+    void set(__unsafe_unretained id const obj, __unsafe_unretained id const value) const {
+        if (setter) {
+            setter(obj, setterSel, value);
+        }
+    }
+
+private:
+    SEL getterSel;
+    id (*getter)(id, SEL) = nullptr;
+    SEL setterSel;
+    void (*setter)(id, SEL, id) = nullptr;
+};
+}
+
 // long getter/setter
 static inline long long RLMGetLong(__unsafe_unretained RLMObjectBase *const obj, NSUInteger colIndex) {
     RLMVerifyAttached(obj);
@@ -214,22 +252,39 @@ static inline RLMObjectBase *RLMGetLinkedObjectForValue(__unsafe_unretained RLMR
 }
 
 // link getter/setter
-static inline RLMObjectBase *RLMGetLink(__unsafe_unretained RLMObjectBase *const obj, NSUInteger colIndex, __unsafe_unretained NSString *const objectClassName) {
+static inline RLMObjectBase *RLMGetLink(__unsafe_unretained RLMObjectBase *const obj,
+                                        NSUInteger colIndex,
+                                        __unsafe_unretained NSString *const objectClassName,
+                                        RLMSuperImpl const& super) {
     RLMVerifyAttached(obj);
-
-    if (obj->_row.is_null_link(colIndex)) {
+    Row const& row = obj->_row;
+    __unsafe_unretained RLMObjectBase *value = super.get(obj);
+    if (row.is_null_link(colIndex)) {
+        if (value) {
+            super.set(obj, nil);
+        }
         return nil;
     }
-    NSUInteger index = obj->_row.get_link(colIndex);
-    return RLMCreateObjectAccessor(obj->_realm, obj->_realm.schema[objectClassName], index);
+
+    size_t dstRow = row.get_link(colIndex);
+    if (value && value->_row.get_index() == dstRow) {
+        return value;
+    }
+
+    __unsafe_unretained RLMRealm *realm = obj->_realm;
+    id newValue = RLMCreateObjectAccessor(realm, realm.schema[objectClassName], dstRow);
+    super.set(obj, newValue);
+    return newValue;
 }
 
 static inline void RLMSetValue(__unsafe_unretained RLMObjectBase *const obj, NSUInteger colIndex,
-                               __unsafe_unretained RLMObjectBase *const val) {
+                               __unsafe_unretained RLMObjectBase *const val,
+                               RLMSuperImpl const& super) {
     RLMVerifyInWriteTransaction(obj);
 
     if (!val) {
         obj->_row.nullify_link(colIndex);
+        super.set(obj, nil);
     }
     else {
         // make sure it is the correct type
@@ -240,8 +295,10 @@ static inline void RLMSetValue(__unsafe_unretained RLMObjectBase *const obj, NSU
                                 valSchema.className, [objSchema.properties[colIndex] objectClassName]];
             @throw RLMException(reason);
         }
+
         RLMObjectBase *link = RLMGetLinkedObjectForValue(obj->_realm, valSchema.className, val, RLMCreationOptionsPromoteStandalone);
         obj->_row.set_link(colIndex, link->_row.get_index());
+        super.set(obj, link);
     }
 }
 
@@ -249,14 +306,21 @@ static inline void RLMSetValue(__unsafe_unretained RLMObjectBase *const obj, NSU
 static inline RLMArray *RLMGetArray(__unsafe_unretained RLMObjectBase *const obj,
                                     NSUInteger colIndex,
                                     __unsafe_unretained NSString *const objectClassName,
-                                    __unsafe_unretained NSString *const propName) {
+                                    __unsafe_unretained NSString *const propName,
+                                    RLMSuperImpl const& super) {
     RLMVerifyAttached(obj);
 
+    if (RLMArray *value = super.get(obj)) {
+        return value;
+    }
+
     realm::LinkViewRef linkView = obj->_row.get_linklist(colIndex);
-    return [RLMArrayLinkView arrayWithObjectClassName:objectClassName
-                                                 view:linkView
-                                                realm:obj->_realm
-                                                  key:propName];
+    RLMArray *ar = [RLMArrayLinkView arrayWithObjectClassName:objectClassName
+                                                         view:linkView
+                                                        realm:obj->_realm
+                                                          key:propName];
+    super.set(obj, ar);
+    return ar;
 }
 
 static inline void RLMSetValue(__unsafe_unretained RLMObjectBase *const obj, NSUInteger colIndex,
@@ -268,7 +332,7 @@ static inline void RLMSetValue(__unsafe_unretained RLMObjectBase *const obj, NSU
     // FIXME: make sure delete rules don't purge objects
     linkView->clear();
     for (RLMObjectBase *link in array) {
-        RLMObjectBase * addedLink = RLMGetLinkedObjectForValue(obj->_realm, link->_objectSchema.className, link, RLMCreationOptionsPromoteStandalone);
+        RLMObjectBase *addedLink = RLMGetLinkedObjectForValue(obj->_realm, link->_objectSchema.className, link, RLMCreationOptionsPromoteStandalone);
         linkView->add(addedLink->_row.get_index());
     }
 }
@@ -349,7 +413,7 @@ static inline void RLMSetValue(__unsafe_unretained RLMObjectBase *const obj, NSU
 }
 
 // dynamic getter with column closure
-static IMP RLMAccessorGetter(RLMProperty *prop, RLMAccessorCode accessorCode, NSString *objectClassName) {
+static IMP RLMAccessorGetter(RLMProperty *prop, RLMAccessorCode accessorCode, Class superClass) {
     NSUInteger colIndex = prop.column;
     NSString *name = prop.name;
     switch (accessorCode) {
@@ -397,14 +461,22 @@ static IMP RLMAccessorGetter(RLMProperty *prop, RLMAccessorCode accessorCode, NS
             return imp_implementationWithBlock(^(__unsafe_unretained RLMObjectBase *const obj) {
                 return RLMGetData(obj, colIndex);
             });
-        case RLMAccessorCodeLink:
+        case RLMAccessorCodeLink: {
+            NSString *objectClassName = prop.objectClassName;
+            RLMSuperImpl super(prop, superClass);
+
             return imp_implementationWithBlock(^id(__unsafe_unretained RLMObjectBase *const obj) {
-                return RLMGetLink(obj, colIndex, objectClassName);
+                return RLMGetLink(obj, colIndex, objectClassName, super);
             });
-        case RLMAccessorCodeArray:
+        }
+        case RLMAccessorCodeArray: {
+            NSString *objectClassName = prop.objectClassName;
+            RLMSuperImpl super(prop, superClass);
+
             return imp_implementationWithBlock(^(__unsafe_unretained RLMObjectBase *const obj) {
-                return RLMGetArray(obj, colIndex, objectClassName, name);
+                return RLMGetArray(obj, colIndex, objectClassName, name, super);
             });
+        }
         case RLMAccessorCodeAny:
             return imp_implementationWithBlock(^(__unsafe_unretained RLMObjectBase *const obj) {
                 return RLMGetAnyProperty(obj, colIndex);
@@ -429,8 +501,21 @@ static IMP RLMMakeSetter(RLMProperty *prop) {
     });
 }
 
+template<typename T>
+static IMP RLMMakeSetter(RLMProperty *prop, Class parentClass) {
+    NSUInteger colIndex = prop.column;
+    NSString *name = prop.name;
+    RLMSuperImpl super(prop, parentClass);
+    return imp_implementationWithBlock(^(__unsafe_unretained RLMObjectBase *const obj, T val) {
+        // needs non-allocating erasure
+        RLMForEachObserver(obj, ^(RLMObjectBase *o) { [o willChangeValueForKey:name]; });
+        RLMSetValue(obj, colIndex, val, super);
+        RLMForEachObserver(obj, ^(RLMObjectBase *o) { [o didChangeValueForKey:name]; });
+    });
+}
+
 // dynamic setter with column closure
-static IMP RLMAccessorSetter(RLMProperty *prop, RLMAccessorCode accessorCode) {
+static IMP RLMAccessorSetter(RLMProperty *prop, RLMAccessorCode accessorCode, Class parentClass) {
     switch (accessorCode) {
         case RLMAccessorCodeByte:     return RLMMakeSetter<char, long long>(prop);
         case RLMAccessorCodeShort:    return RLMMakeSetter<short, long long>(prop);
@@ -443,58 +528,48 @@ static IMP RLMAccessorSetter(RLMProperty *prop, RLMAccessorCode accessorCode) {
         case RLMAccessorCodeString:   return RLMMakeSetter<NSString *>(prop);
         case RLMAccessorCodeDate:     return RLMMakeSetter<NSDate *>(prop);
         case RLMAccessorCodeData:     return RLMMakeSetter<NSData *>(prop);
-        case RLMAccessorCodeLink:     return RLMMakeSetter<RLMObjectBase *>(prop);
+        case RLMAccessorCodeLink:     return RLMMakeSetter<RLMObjectBase *>(prop, parentClass);
         case RLMAccessorCodeArray:    return RLMMakeSetter<RLMArray *>(prop);
         case RLMAccessorCodeAny:      return RLMMakeSetter<id>(prop);
     }
 }
 
-// call getter for superclass for property at colIndex
-static id RLMSuperGet(RLMObjectBase *obj, NSString *propName) {
-    typedef id (*getter_type)(RLMObjectBase *, SEL);
-    RLMProperty *prop = obj->_objectSchema[propName];
-    Class superClass = class_getSuperclass(obj.class);
-    getter_type superGetter = (getter_type)[superClass instanceMethodForSelector:prop.getterSel];
-    return superGetter(obj, prop.getterSel);
-}
-
-// call setter for superclass for property at colIndex
-static void RLMSuperSet(RLMObjectBase *obj, NSString *propName, id val) {
-    typedef void (*setter_type)(RLMObjectBase *, SEL, RLMArray *ar);
-    RLMProperty *prop = obj->_objectSchema[propName];
-    Class superClass = class_getSuperclass(obj.class);
-    setter_type superSetter = (setter_type)[superClass instanceMethodForSelector:prop.setterSel];
-    superSetter(obj, prop.setterSel, val);
-}
-
 // getter/setter for standalone
-static IMP RLMAccessorStandaloneGetter(RLMProperty *prop, RLMAccessorCode accessorCode, NSString *objectClassName) {
+static IMP RLMAccessorStandaloneGetter(RLMProperty *prop, RLMAccessorCode accessorCode, Class superClass) {
     // only override getters for RLMArray properties
     if (accessorCode == RLMAccessorCodeArray) {
+        NSString *objectClassName = prop.objectClassName;
         NSString *propName = prop.name;
+        RLMSuperImpl super(prop, superClass);
+
         return imp_implementationWithBlock(^(RLMObjectBase *obj) {
-            id val = RLMSuperGet(obj, propName);
+            id val = super.get(obj);
             if (!val) {
                 val = [[RLMArray alloc] initWithObjectClassName:objectClassName parentObject:obj key:propName];
-                RLMSuperSet(obj, propName, val);
+                super.set(obj, val);
             }
             return val;
         });
     }
     return nil;
 }
-static IMP RLMAccessorStandaloneSetter(RLMProperty *prop, RLMAccessorCode accessorCode) {
+static IMP RLMAccessorStandaloneSetter(RLMProperty *prop, RLMAccessorCode accessorCode, Class superClass) {
     // only override getters for RLMArray properties
     if (accessorCode == RLMAccessorCodeArray) {
-        NSString *propName = prop.name;
         NSString *objectClassName = prop.objectClassName;
+        NSString *propName = prop.name;
+        RLMSuperImpl super(prop, superClass);
+
         return imp_implementationWithBlock(^(RLMObjectBase *obj, id<NSFastEnumeration> ar) {
-            // make copy when setting (as is the case for all other variants)
-            RLMArray *standaloneAr = [[RLMArray alloc] initWithObjectClassName:objectClassName parentObject:obj key:propName];
-            if ((id)ar != NSNull.null) {
-                [standaloneAr addObjects:ar];
+            if (ar == nil || ar == (id)NSNull.null) {
+                super.set(obj, nil);
             }
-            RLMSuperSet(obj, propName, standaloneAr);
+            else {
+                // make copy when setting (as is the case for all other variants)
+                RLMArray *standaloneAr = [[RLMArray alloc] initWithObjectClassName:objectClassName parentObject:obj key:propName];
+                [standaloneAr addObjects:ar];
+                super.set(obj, standaloneAr);
+            }
         });
     }
     return nil;
@@ -596,8 +671,8 @@ void RLMReplaceSharedSchemaMethod(Class accessorClass, RLMObjectSchema *schema) 
 static Class RLMCreateAccessorClass(Class objectClass,
                                     RLMObjectSchema *schema,
                                     NSString *accessorClassPrefix,
-                                    IMP (*getterGetter)(RLMProperty *, RLMAccessorCode, NSString *),
-                                    IMP (*setterGetter)(RLMProperty *, RLMAccessorCode)) {
+                                    IMP (*getterGetter)(RLMProperty *, RLMAccessorCode, Class),
+                                    IMP (*setterGetter)(RLMProperty *, RLMAccessorCode, Class)) {
     // throw if no schema, prefix, or object class
     if (!objectClass || !schema || !accessorClassPrefix) {
         @throw RLMException(@"Missing arguments");
@@ -619,13 +694,13 @@ static Class RLMCreateAccessorClass(Class objectClass,
         RLMProperty *prop = schema.properties[propNum];
         RLMAccessorCode accessorCode = accessorCodeForType(prop.objcType, prop.type);
         if (prop.getterSel && getterGetter) {
-            IMP getterImp = getterGetter(prop, accessorCode, prop.objectClassName);
+            IMP getterImp = getterGetter(prop, accessorCode, objectClass);
             if (getterImp) {
                 class_replaceMethod(accClass, prop.getterSel, getterImp, getterTypeStringForObjcCode(prop.objcType));
             }
         }
         if (prop.setterSel && setterGetter) {
-            IMP setterImp = setterGetter(prop, accessorCode);
+            IMP setterImp = setterGetter(prop, accessorCode, objectClass);
             if (setterImp) {
                 class_replaceMethod(accClass, prop.setterSel, setterImp, setterTypeStringForObjcCode(prop.objcType));
             }
@@ -714,10 +789,10 @@ void RLMDynamicSet(__unsafe_unretained RLMObjectBase *const obj,
             break;
         case RLMAccessorCodeLink: {
             if (!val || val == NSNull.null) {
-                RLMSetValue(obj, col, (RLMObjectBase *)nil);
+                RLMSetValue(obj, col, (RLMObjectBase *)nil, {});
             }
             else {
-                RLMSetValue(obj, col, RLMGetLinkedObjectForValue(obj->_realm, prop.objectClassName, val, creationOptions));
+                RLMSetValue(obj, col, RLMGetLinkedObjectForValue(obj->_realm, prop.objectClassName, val, creationOptions), {});
             }
             break;
         }
@@ -744,7 +819,7 @@ id RLMDynamicGet(__unsafe_unretained RLMObjectBase *obj, __unsafe_unretained NSS
     RLMProperty *prop = obj->_objectSchema[propName];
     if (!prop) {
         @throw RLMException(@"Invalid property name",
-                            @{@"Property name:" : propName ?: @"nil",
+                            @{@"Property name:": propName ?: @"nil",
                               @"Class name": obj->_objectSchema.className});
     }
     NSUInteger col = prop.column;
@@ -760,8 +835,8 @@ id RLMDynamicGet(__unsafe_unretained RLMObjectBase *obj, __unsafe_unretained NSS
         case RLMAccessorCodeString:   return RLMGetString(obj, col);
         case RLMAccessorCodeDate:     return RLMGetDate(obj, col);
         case RLMAccessorCodeData:     return RLMGetData(obj, col);
-        case RLMAccessorCodeLink:     return RLMGetLink(obj, col, prop.objectClassName);
-        case RLMAccessorCodeArray:    return RLMGetArray(obj, col, prop.objectClassName, prop.name);
+        case RLMAccessorCodeLink:     return RLMGetLink(obj, col, prop.objectClassName, {});
+        case RLMAccessorCodeArray:    return RLMGetArray(obj, col, prop.objectClassName, prop.name, {});
         case RLMAccessorCodeAny:      return RLMGetAnyProperty(obj, col);
     }
 }
