@@ -669,7 +669,7 @@ struct ObserverState {
     size_t row;
     size_t column;
     NSString *key;
-    __unsafe_unretained RLMObservable *observable;
+    RLMObservationInfo2 *observable;
 
     bool changed = false;
     bool multipleLinkviewChanges = false;
@@ -686,23 +686,24 @@ public:
     ModifiedRowParser(std::vector<ObserverState>& observers) : observers(observers) { }
 
     void parse_complete() {
-        for (auto& o : observers) {
+        for (auto const& o : observers) {
             if (o.row == realm::not_found) {
-                o.observable->_returnNil = false;
-                [o.observable willChangeValueForKey:o.key];
-                o.observable->_returnNil = true;
-                [o.observable didChangeValueForKey:o.key];
-                [o.observable willChangeValueForKey:@"invalidated"];
+//                o.observable->_returnNil = false;
+//                [o.observable willChangeValueForKey:o.key];
+//                o.observable->_returnNil = true;
+//                [o.observable didChangeValueForKey:o.key];
+//                [o.observable willChangeValueForKey:@"invalidated"];
+                for_each(o.observable, [&](auto obj) { [obj willChangeValueForKey:@"invalidated"]; });
             }
             if (!o.changed)
                 continue;
-
             if (!o.linkviewChangeIndexes)
-                [o.observable willChangeValueForKey:o.key];
-            else
-                [o.observable willChange:o.linkviewChangeKind
-                         valuesAtIndexes:o.linkviewChangeIndexes
-                                  forKey:o.key];
+                for_each(o.observable, [&](auto obj) { [obj willChangeValueForKey:o.key]; });
+            else {
+                for_each(o.observable, [&](auto obj) {
+                    [obj willChange:NSKeyValueChangeRemoval valuesAtIndexes:o.linkviewChangeIndexes forKey:o.key];
+                });
+            }
         }
     }
 
@@ -826,7 +827,7 @@ public:
             if (o->multipleLinkviewChanges)
                 return true;
 
-            auto range = NSMakeRange(0, o->observable->_row.get_linklist(o->column)->size());
+            auto range = NSMakeRange(0, o->observable->row.get_linklist(o->column)->size());
             if (!o->linkviewChangeIndexes) {
                 o->linkviewChangeIndexes = [NSMutableIndexSet indexSetWithIndexesInRange:range];
                 o->linkviewChangeKind = NSKeyValueChangeRemoval;
@@ -836,6 +837,7 @@ public:
                 range.length += [o->linkviewChangeIndexes count];
                 [o->linkviewChangeIndexes addIndexesInRange:range];
             }
+            // FIXME: clear after insert doesn't need to set multiple
             else {
                 o->multipleLinkviewChanges = false;
                 o->linkviewChangeIndexes = nil;
@@ -895,9 +897,9 @@ static void call_with_notifications(SharedGroup *sg, RLMSchema *schema, Func&& f
     std::vector<ObserverState> observers;
     // all this should maybe be precomputed or cached or something
     for (RLMObjectSchema *objectSchema in schema.objectSchema) {
-        for (__unsafe_unretained RLMObservable *observable : objectSchema->_observers) {
-            observable->_returnNil = false;
-            auto const& row = observable->_row;
+        for (auto observable : objectSchema->_observedObjects) {
+//            observable->_returnNil = false;
+            auto const& row = observable->row;
             if (!row.is_attached()) // FIXME: should maybe try to remove from array on invalidate
                 continue;
             for (size_t i = 0; i < objectSchema.properties.count; ++i) {
@@ -921,16 +923,17 @@ static void call_with_notifications(SharedGroup *sg, RLMSchema *schema, Func&& f
 
     for (auto const& o : observers) {
         if (o.row == realm::not_found) {
-            [o.observable didChangeValueForKey:@"invalidated"];
+            for_each(o.observable, [&](auto obj) { [obj didChangeValueForKey:@"invalidated"]; });
         }
         if (!o.changed)
             continue;
         if (!o.linkviewChangeIndexes)
-            [o.observable didChangeValueForKey:o.key];
-        else
-            [o.observable didChange:o.linkviewChangeKind
-                     valuesAtIndexes:o.linkviewChangeIndexes
-                              forKey:o.key];
+            for_each(o.observable, [&](auto obj) { [obj didChangeValueForKey:o.key]; });
+        else {
+            for_each(o.observable, [&](auto obj) {
+                [obj didChange:NSKeyValueChangeRemoval valuesAtIndexes:o.linkviewChangeIndexes forKey:o.key];
+            });
+        }
     }
 }
 

@@ -21,14 +21,23 @@
 #import <realm/link_view.hpp> // required by row.hpp
 #import <realm/row.hpp>
 
-@interface RLMObservable : NSObject {
-    @public
-    realm::Row _row;
-    bool _returnNil;
+struct RLMObservationInfo2 {
+    RLMObservationInfo2 *next = nullptr;
+    RLMObservationInfo2 *prev = nullptr;
+    realm::Row row;
+    __unsafe_unretained id object;
+    __unsafe_unretained RLMObjectSchema *objectSchema;
+    void *kvoInfo = nullptr;
+
+    RLMObservationInfo2(RLMObjectSchema *objectSchema, std::size_t row, id object);
+    ~RLMObservationInfo2();
+};
+
+template<typename F>
+void for_each(const RLMObservationInfo2 *info, F&& f) {
+    for (; info; info = info->next)
+        f(info->object);
 }
-@property (nonatomic) void *observationInfo;
-- (instancetype)initWithRow:(realm::Row const&)row realm:(RLMRealm *)realm schema:(RLMObjectSchema *)objectSchema;
-@end
 
 // RLMObject accessor and read/write realm
 @interface RLMObjectBase () {
@@ -43,7 +52,5 @@
 
 void RLMOverrideStandaloneMethods(Class cls);
 
-void RLMWillChange(RLMObjectBase *obj, NSString *key);
-void RLMDidChange(RLMObjectBase *obj, NSString *key);
-
+void RLMForEachObserver(RLMObjectBase *obj, void (^block)(RLMObjectBase*));
 void RLMTrackDeletions(RLMRealm *realm, dispatch_block_t block);
