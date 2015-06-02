@@ -334,6 +334,10 @@ static void changeArray(__unsafe_unretained RLMArrayLinkView *const ar, NSKeyVal
 }
 
 - (id)valueForKey:(NSString *)key {
+    if ([key isEqualToString:@"invalidated"]) {
+        return @(!_backingLinkView->is_attached());
+    }
+
     RLMLinkViewArrayValidateAttached(self);
     const size_t size = _backingLinkView->size();
     return RLMCollectionValueForKey(key, _realm, _objectSchema, size, ^size_t(size_t index) {

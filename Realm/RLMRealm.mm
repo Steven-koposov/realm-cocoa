@@ -688,11 +688,10 @@ public:
     void parse_complete() {
         for (auto const& o : observers) {
             if (o.row == realm::not_found) {
-//                o.observable->_returnNil = false;
-//                [o.observable willChangeValueForKey:o.key];
-//                o.observable->_returnNil = true;
-//                [o.observable didChangeValueForKey:o.key];
-//                [o.observable willChangeValueForKey:@"invalidated"];
+                o.observable->setReturnNil(false);
+                for_each(o.observable, [&](auto obj) { [obj willChangeValueForKey:o.key]; });
+                o.observable->setReturnNil(true);
+                for_each(o.observable, [&](auto obj) { [obj didChangeValueForKey:o.key]; });
                 for_each(o.observable, [&](auto obj) { [obj willChangeValueForKey:@"invalidated"]; });
             }
             if (!o.changed)
@@ -701,7 +700,7 @@ public:
                 for_each(o.observable, [&](auto obj) { [obj willChangeValueForKey:o.key]; });
             else {
                 for_each(o.observable, [&](auto obj) {
-                    [obj willChange:NSKeyValueChangeRemoval valuesAtIndexes:o.linkviewChangeIndexes forKey:o.key];
+                    [obj willChange:o.linkviewChangeKind valuesAtIndexes:o.linkviewChangeIndexes forKey:o.key];
                 });
             }
         }
@@ -898,10 +897,10 @@ static void call_with_notifications(SharedGroup *sg, RLMSchema *schema, Func&& f
     // all this should maybe be precomputed or cached or something
     for (RLMObjectSchema *objectSchema in schema.objectSchema) {
         for (auto observable : objectSchema->_observedObjects) {
-//            observable->_returnNil = false;
             auto const& row = observable->row;
             if (!row.is_attached()) // FIXME: should maybe try to remove from array on invalidate
                 continue;
+            observable->setReturnNil(false);
             for (size_t i = 0; i < objectSchema.properties.count; ++i) {
                 observers.push_back({
                     row.get_table()->get_index_in_group(),
@@ -931,7 +930,7 @@ static void call_with_notifications(SharedGroup *sg, RLMSchema *schema, Func&& f
             for_each(o.observable, [&](auto obj) { [obj didChangeValueForKey:o.key]; });
         else {
             for_each(o.observable, [&](auto obj) {
-                [obj didChange:NSKeyValueChangeRemoval valuesAtIndexes:o.linkviewChangeIndexes forKey:o.key];
+                [obj didChange:o.linkviewChangeKind valuesAtIndexes:o.linkviewChangeIndexes forKey:o.key];
             });
         }
     }

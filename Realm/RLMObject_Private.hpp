@@ -26,11 +26,19 @@ struct RLMObservationInfo2 {
     RLMObservationInfo2 *prev = nullptr;
     realm::Row row;
     __unsafe_unretained id object;
-    __unsafe_unretained RLMObjectSchema *objectSchema;
+    RLMObjectSchema *objectSchema;
     void *kvoInfo = nullptr;
+    bool returnNil = false;
 
     RLMObservationInfo2(RLMObjectSchema *objectSchema, std::size_t row, id object);
     ~RLMObservationInfo2();
+
+    void setReturnNil(bool value) {
+        for (auto info = this; info; info = info->next)
+            info->returnNil = value;
+    }
+
+    void setRow(size_t newRow);
 };
 
 template<typename F>

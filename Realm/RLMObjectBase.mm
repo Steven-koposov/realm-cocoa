@@ -35,19 +35,11 @@
 @end
 
 RLMObservationInfo2::RLMObservationInfo2(RLMObjectSchema *objectSchema, std::size_t row, id object)
-: row((*objectSchema.table)[row])
-, object(object)
+: object(object)
 , objectSchema(objectSchema)
 {
-    for (auto info : objectSchema->_observedObjects) {
-        if (info->row.get_index() == row) {
-            prev = info;
-            next = info->next;
-            info->next = this;
-            return;
-        }
-    }
-    objectSchema->_observedObjects.push_back(this);
+    if (row != realm::npos)
+        setRow(row);
 }
 
 RLMObservationInfo2::~RLMObservationInfo2() {
@@ -69,6 +61,20 @@ RLMObservationInfo2::~RLMObservationInfo2() {
             }
         }
     }
+}
+
+void RLMObservationInfo2::setRow(size_t newRow) {
+    REALM_ASSERT(!row);
+    row = (*objectSchema.table)[newRow];
+    for (auto info : objectSchema->_observedObjects) {
+        if (info->row && info->row.get_index() == newRow) {
+            prev = info;
+            next = info->next;
+            info->next = this;
+            return;
+        }
+    }
+    objectSchema->_observedObjects.push_back(this);
 }
 
 const NSUInteger RLMDescriptionMaxDepth = 5;
@@ -165,6 +171,12 @@ static id RLMValidatedObjectForProperty(id obj, RLMProperty *prop, RLMSchema *sc
         _objectSchema = schema;
     }
     return self;
+}
+
+- (id)valueForKey:(NSString *)key {
+    if (_observationInfo && _observationInfo->returnNil && ![key isEqualToString:@"invalidated"])
+        return nil;
+    return [super valueForKey:key];
 }
 
 // overridden at runtime per-class for performance
@@ -271,7 +283,23 @@ static id RLMValidatedObjectForProperty(id obj, RLMProperty *prop, RLMSchema *sc
             options:(NSKeyValueObservingOptions)options
             context:(void *)context {
     if (!_observationInfo) {
-        _observationInfo = std::make_unique<RLMObservationInfo2>(_objectSchema, _row.get_index(), self);
+        _observationInfo = std::make_unique<RLMObservationInfo2>(_objectSchema, _row.is_attached() ? _row.get_index() : realm::npos, self);
+    }
+    else if (_row && !_observationInfo->row) {
+        _observationInfo->objectSchema = _objectSchema;
+        _observationInfo->setRow(_row.get_index());
+    }
+
+    if (!_row) {
+        if (!self->_standaloneObservers)
+            self->_standaloneObservers = [NSMutableArray new];
+
+        RLMObservationInfo *info = [RLMObservationInfo new];
+        info.observer = observer;
+        info.options = options;
+        info.context = context;
+        info.key = keyPath;
+        [self->_standaloneObservers addObject:info];
     }
 
     [super addObserver:observer forKeyPath:keyPath options:options context:context];
@@ -460,22 +488,6 @@ void RLMOverrideStandaloneMethods(Class cls) {
     };
 
     static const methodInfo methods[] = {
-        make(@selector(addObserver:forKeyPath:options:context:), [](SEL sel, IMP superImp) {
-            auto superFn = (void (*)(id, SEL, id, NSString *, NSKeyValueObservingOptions, void *))superImp;
-            return ^(RLMObjectBase *self, id observer, NSString *keyPath, NSKeyValueObservingOptions options, void *context) {
-                if (!self->_standaloneObservers)
-                    self->_standaloneObservers = [NSMutableArray new];
-
-                RLMObservationInfo *info = [RLMObservationInfo new];
-                info.observer = observer;
-                info.options = options;
-                info.context = context;
-                info.key = keyPath;
-                [self->_standaloneObservers addObject:info];
-                superFn(self, sel, observer, keyPath, options, context);
-            };
-        }),
-
         make(@selector(removeObserver:forKeyPath:), [](SEL sel, IMP superImp) {
             auto superFn = (void (*)(id, SEL, id, NSString *))superImp;
             return ^(RLMObjectBase *self, id observer, NSString *keyPath) {
@@ -582,11 +594,11 @@ void RLMTrackDeletions(__unsafe_unretained RLMRealm *const realm, dispatch_block
     block();
 
     for (auto const& change : changes) {
-//        change.observable->_returnNil = true;
+        change.observable->setReturnNil(true);
         for_each(change.observable, [&](auto o) { [o didChangeValueForKey:change.property]; });
     }
     for (auto const& change : arrayChanges) {
-//        change.observable->_returnNil = true;
+        change.observable->setReturnNil(true);
         for_each(change.observable, [&](auto o) { [o didChange:NSKeyValueChangeRemoval valuesAtIndexes:change.indexes forKey:change.property]; });
     }
 
